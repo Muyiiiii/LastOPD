@@ -98,8 +98,8 @@ def split_rollout_ids(rollout_ids, num_workers):
 def worker_process(args_tuple):
     model_name, samples, rollout_id_list, gpu_id, enable_thinking = args_tuple
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    # 单机 4 worker 同时起 vLLM 引擎会抢同一个分布式初始化端口(EADDRINUSE),
-    # 按 GPU 号错开固定端口段避免竞争
+    # Several vLLM engines starting on one node race for the same distributed-init port (EADDRINUSE);
+    # give each GPU its own port range.
     os.environ["VLLM_PORT"] = str(36000 + 200 * int(gpu_id))
     results = []
     llm = None
@@ -122,12 +122,12 @@ def worker_process(args_tuple):
                 try:
                     if hasattr(tokenizer, "encode"):
                         encoded = tokenizer.encode(stop_token, add_special_tokens=False)
-                        # 仅接受单 token(真正的特殊符);多 token 说明该词表无此特殊符,跳过
+                        # accept only single-token special symbols; multi-token means the vocab lacks it, skip
                         if encoded and len(encoded) == 1:
                             stop_token_ids.append(encoded[0])
                 except Exception:
                     pass
-            print(f"[GPU {gpu_id}] stop_token_ids={stop_token_ids} (eos={tokenizer.eos_token_id} 由 vLLM 默认处理)", flush=True)
+            print(f"[GPU {gpu_id}] stop_token_ids={stop_token_ids} (eos={tokenizer.eos_token_id} is handled by vLLM by default)", flush=True)
         except Exception as e:
             tokenizer = None
             print(f"[GPU {gpu_id}] Warning: Could not get tokenizer for stop tokens: {e}", flush=True)
@@ -190,8 +190,8 @@ def main():
     thinking_group = parser.add_mutually_exclusive_group()
     thinking_group.add_argument("--enable-thinking", dest="enable_thinking", action="store_true")
     thinking_group.add_argument("--disable-thinking", dest="enable_thinking", action="store_false")
-    # 默认值可由环境变量 ENABLE_THINKING("True"/"False")覆盖;CLI 旗标优先级更高。
-    # 环境变量不设时默认 False,与原版行为一致。
+    # Default comes from the ENABLE_THINKING env var ("True"/"False"); the CLI flags take precedence.
+    # Unset -> False, matching the original evaluation protocol.
     parser.set_defaults(
         enable_thinking=os.environ.get("ENABLE_THINKING", "False").strip().lower() in ("1", "true"))
     args = parser.parse_args()
