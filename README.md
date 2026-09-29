@@ -74,4 +74,6 @@ If you use this code, please also cite OPRD and OPD (see `docs/README_OPRD.md`).
 
 ## License
 
-Apache-2.0, inherited from verl / OPRD (see `verl/LICENSE`).
+The verl code base is Apache-2.0 (`verl/LICENSE`) and the LastOPD additions are released under the same
+license. The upstream OPRD repository does not declare a license for its own modifications; please refer to
+the OPRD authors for the terms covering that part of the code.
