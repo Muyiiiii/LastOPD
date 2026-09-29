@@ -2292,6 +2292,10 @@ class RewardModelWorker(Worker, DistProfilerExtension):
                             last_k=rep_distillation_last_k,
                             first_k=rep_distillation_first_k,
                         )
+                    # REP_TEACHER_CACHE_DTYPE=bf16 halves the host-side cache of the teacher hidden
+                    # states (the actor casts back to fp32 before the loss). Default fp32 = unchanged.
+                    if os.environ.get("REP_TEACHER_CACHE_DTYPE", "fp32") == "bf16":
+                        teacher_last_hidden_repr = teacher_last_hidden_repr.to(torch.bfloat16)
                     del output
 
             else:
@@ -2900,7 +2904,9 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             teacher_last_hidden_repr = None
             if len(output_teacher_last_hidden_repr) > 0:
-                repr_shapes = [t.shape for t in output_teacher_last_hidden_repr]
+                # Only non-batch dims must match for cat(dim=0); dynamic bsz yields
+                # variable per-micro-batch sequence counts (e.g. 2+6), which is fine.
+                repr_shapes = [t.shape[1:] for t in output_teacher_last_hidden_repr]
                 if len(set(repr_shapes)) > 1:
                     raise RuntimeError(
                         "Inconsistent teacher_last_hidden_repr shapes across micro-batches "
@@ -2910,7 +2916,8 @@ class RewardModelWorker(Worker, DistProfilerExtension):
 
             teacher_attn_rows = None
             if len(output_teacher_attn_rows) > 0:
-                attn_shapes = [t.shape for t in output_teacher_attn_rows]
+                # Same as above: batch dim may vary across micro-batches.
+                attn_shapes = [t.shape[1:] for t in output_teacher_attn_rows]
                 if len(set(attn_shapes)) > 1:
                     raise RuntimeError(
                         "Inconsistent teacher_attn_rows shapes across micro-batches: "

@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import Literal
 
@@ -31,18 +33,84 @@ RepDistillationPositions = Literal["last", "all", "last_k", "first_k"]
 VALID_REP_DISTILLATION_POSITIONS = ("last", "all", "last_k", "first_k")
 
 RepDistillationLayers = Literal["last", "all", "even", "odd"]
-VALID_REP_DISTILLATION_LAYERS = ("last", "all", "even", "odd")
+VALID_REP_DISTILLATION_LAYERS = ("last", "all", "even", "odd", "emb")
+# "first_N" (e.g. first_1, first_4): supervise the first N transformer blocks;
+# "emb": supervise the embedding output (hidden_states[0]) only.
+_FIRST_N_LAYERS_RE = re.compile(r"^first_(\d+)$")
+# "lastN_M" (e.g. lastN_4): supervise the last M transformer blocks.
+_LAST_N_LAYERS_RE = re.compile(r"^lastN_(\d+)$")
+# "neg_K" (e.g. neg_2): supervise the single K-th-from-last transformer block
+# (neg_1 == last). 跨架构时师生两侧同取"倒数第 K 层",深度语义对齐。
+_NEG_K_LAYER_RE = re.compile(r"^neg_(\d+)$")
 
 RepProjectorMode = Literal["full", "low_rank", "low_rank_residual"]
 VALID_REP_PROJECTOR_MODES = ("full", "low_rank", "low_rank_residual")
 
 
+def _parse_first_n_layers(layers: str) -> int | None:
+    """Return N for ``first_N`` layer modes, else None."""
+    m = _FIRST_N_LAYERS_RE.match(layers)
+    if m is None:
+        return None
+    n = int(m.group(1))
+    if n < 1:
+        raise ValueError(f"first_N layers requires N >= 1, got {layers!r}")
+    return n
+
+
+def _parse_last_n_layers(layers: str) -> int | None:
+    """Return M for ``lastN_M`` layer modes, else None."""
+    m = _LAST_N_LAYERS_RE.match(layers)
+    if m is None:
+        return None
+    n = int(m.group(1))
+    if n < 1:
+        raise ValueError(f"lastN_M layers requires M >= 1, got {layers!r}")
+    return n
+
+
+def _parse_neg_k_layer(layers: str) -> int | None:
+    """Return K for ``neg_K`` single-layer modes, else None."""
+    m = _NEG_K_LAYER_RE.match(layers)
+    if m is None:
+        return None
+    k = int(m.group(1))
+    if k < 1:
+        raise ValueError(f"neg_K layer requires K >= 1, got {layers!r}")
+    return k
+
+
 def validate_rep_distillation_layers(layers: str) -> str:
-    if layers not in VALID_REP_DISTILLATION_LAYERS:
+    if (
+        layers not in VALID_REP_DISTILLATION_LAYERS
+        and _parse_first_n_layers(layers) is None
+        and _parse_last_n_layers(layers) is None
+        and _parse_neg_k_layer(layers) is None
+    ):
         raise ValueError(
-            f"rep_distillation_layers must be one of {VALID_REP_DISTILLATION_LAYERS}, got {layers!r}"
+            f"rep_distillation_layers must be one of {VALID_REP_DISTILLATION_LAYERS}, "
+            f"'first_N', 'lastN_M' or 'neg_K' (N, M, K >= 1), got {layers!r}"
         )
     return layers
+
+
+def rep_layers_is_multi(layers: str) -> bool:
+    """Whether the layer mode yields a stacked (B, L, ...) multi-layer repr (L > 1).
+
+    Single-layer modes ("last", "emb", "first_1", "lastN_1") keep the legacy 3D repr shape.
+    """
+    validate_rep_distillation_layers(layers)
+    if layers in ("last", "emb"):
+        return False
+    if _parse_neg_k_layer(layers) is not None:
+        return False
+    first_n = _parse_first_n_layers(layers)
+    if first_n is not None:
+        return first_n > 1
+    last_n = _parse_last_n_layers(layers)
+    if last_n is not None:
+        return last_n > 1
+    return True
 
 
 def get_rep_distillation_hidden_state_indices(num_hidden_states: int, layers: str) -> list[int]:
@@ -53,8 +121,24 @@ def get_rep_distillation_hidden_state_indices(num_hidden_states: int, layers: st
 
     if layers == "last":
         return [num_hidden_states - 1]
+    if layers == "emb":
+        return [0]
+    neg_k = _parse_neg_k_layer(layers)
+    if neg_k is not None:
+        if neg_k > num_hidden_states - 1:
+            raise ValueError(
+                f"neg_{neg_k} out of range for {num_hidden_states - 1} transformer layers"
+            )
+        return [num_hidden_states - neg_k]
 
     num_transformer_layers = num_hidden_states - 1
+    first_n = _parse_first_n_layers(layers)
+    if first_n is not None:
+        return [1 + layer_idx for layer_idx in range(min(first_n, num_transformer_layers))]
+    last_n = _parse_last_n_layers(layers)
+    if last_n is not None:
+        n = min(last_n, num_transformer_layers)
+        return list(range(num_hidden_states - n, num_hidden_states))
     if layers == "all":
         return list(range(1, num_hidden_states))
     if layers == "even":
@@ -174,6 +258,11 @@ def build_rep_distillation_position_mask(
         return response_mask * in_first_k.float()
 
     # last_k: per sample use min(last_k, valid_len) trailing tokens
+    # REP_LAST_K_TAIL_OFFSET(env,默认 0):窗口整体前移 N 个 token,排除响应末尾
+    # (答案/EOS 区域)——检验"对齐停止策略导致长度病"假说(M3)。师生两侧同函数,自动对称。
+    tail_offset = int(os.environ.get("REP_LAST_K_TAIL_OFFSET", "0"))
+    if tail_offset > 0:
+        last_valid = (last_valid - tail_offset).clamp(min=1)
     effective_k = get_per_sample_distillation_k(response_mask, last_k).unsqueeze(1)
     lower = (last_valid - effective_k).clamp(min=0)
     in_last_k = (token_pos >= lower) & (token_pos < last_valid)
@@ -415,6 +504,14 @@ def get_proportional_layer_indices(
     """
     if num_target_layers <= 0 or num_source_layers <= 0:
         raise ValueError("layer counts must be positive")
+    # M6: allow overriding the proportional map with an empirically measured
+    # correspondence (e.g. the CKA ridge), passed as a comma-separated index list.
+    import os as _os
+    _custom = _os.environ.get("REP_LAYER_MAP", "")
+    if _custom:
+        _idx = [int(x) for x in _custom.split(",")]
+        if len(_idx) == num_target_layers and all(0 <= i < num_source_layers for i in _idx):
+            return torch.tensor(_idx, device=device, dtype=torch.long)
     if num_target_layers == num_source_layers:
         return torch.arange(num_target_layers, device=device, dtype=torch.long)
     if num_target_layers == 1:

@@ -1306,6 +1306,17 @@ class RayPPOTrainer:
                                 if "format_mask" in reward_extra_infos_dict.keys():
                                     batch.batch["format_mask"] = reward_extra_infos_dict["format_mask"]
                     
+                    if rep_distillation_only and self.use_reference_policy:
+                        # Pure-rep + KL self-preservation: dp_actor's rep_only KL branch needs
+                        # ref_log_prob, but the not-rep-only block below (which normally
+                        # computes it) is skipped in rep-only mode. Compute it here.
+                        with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            if not self.ref_in_actor:
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            else:
+                                ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
                     if not rep_distillation_only:
                         from verl.trainer.ppo.rollout_corr_helper import (
                             compute_rollout_correction_and_add_to_batch,

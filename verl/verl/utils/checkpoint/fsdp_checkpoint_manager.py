@@ -142,8 +142,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 remote_optim_path = os.path.join(local_path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
                 local_optim_path = copy_to_local(remote_optim_path)
                 optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
-                self.optimizer.load_state_dict(optimizer_state_dict)
-                log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+                try:
+                    self.optimizer.load_state_dict(optimizer_state_dict)
+                    log_with_rank(f"Loaded optimizer from {remote_optim_path}", rank=self.rank, logger=logger)
+                except ValueError as e:
+                    # rep 投影头的参数组是训练中惰性注册的:保存时 2 组、加载时刻只有 1 组。
+                    # 组数不匹配时跳过优化器状态(模型权重照常恢复,Adam 状态重置)——
+                    # 否则续训直接崩(B4 resume 事故)。
+                    log_with_rank(
+                        f"Skipped optimizer state (param group mismatch: {e}); "
+                        "resuming with fresh optimizer state",
+                        rank=self.rank, logger=logger,
+                    )
 
         if self.should_load_extra:
             remote_extra_state_path = os.path.join(

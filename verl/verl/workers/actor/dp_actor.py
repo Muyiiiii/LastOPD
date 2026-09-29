@@ -59,6 +59,7 @@ from verl.utils.rep_distillation import (
     compute_rep_alignment_metrics,
     multi_layer_normalized_cosine_similarity,
     multi_layer_normalized_mse_loss,
+    rep_layers_is_multi,
     validate_rep_distillation_layers,
     validate_rep_distillation_positions,
     validate_rep_projector_mode,
@@ -73,6 +74,23 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+class _PerLayerRepProjector(nn.Module):
+    """full 模式的逐层独立投影头:输入 (B, L, T, D) 时第 l 层走 heads[l]。
+
+    与共享头(单实例)相对——不同深度的表示统计不同,独立头消除
+    "一套变换适配所有深度"的额外约束(rep_full_projector_per_layer=True 启用)。
+    """
+
+    def __init__(self, builder, num_layers: int):
+        super().__init__()
+        self.heads = nn.ModuleList([builder() for _ in range(num_layers)])
+
+    def forward(self, x):
+        if x.dim() == 4:
+            return torch.stack([self.heads[i](x[:, i]) for i in range(x.size(1))], dim=1)
+        return self.heads[0](x)
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -119,11 +137,31 @@ class DataParallelPPOActor(BasePPOActor):
         self.residual_low_rank_projector: ResidualLowRankCrossArchProjector | None = None
         self._residual_low_rank_projector_in_optimizer = False
 
-    def _get_or_create_rep_projector(self, student_dim: int, teacher_dim: int) -> nn.Linear | None:
+    def _get_or_create_rep_projector(
+        self, student_dim: int, teacher_dim: int, num_layers: int = 1
+    ) -> nn.Module | None:
         if student_dim == teacher_dim:
             return None
         if self.rep_projector is None:
-            self.rep_projector = nn.Linear(student_dim, teacher_dim, bias=False).to(get_device_id())
+            # rep_full_projector=mlp: BYOL/SimSiam 式随机初始化可训练预测头,
+            # 直接以学生 hidden 预测教师 hidden(不经 PCA 子空间)
+            proj_type = str(self.config.get("rep_full_projector", "linear")).lower()
+
+            def build() -> nn.Module:
+                if proj_type == "mlp":
+                    hidden_dim = student_dim * int(self.config.get("rep_mlp_hidden_mult", 4))
+                    return nn.Sequential(
+                        nn.Linear(student_dim, hidden_dim, bias=False),
+                        nn.GELU(),
+                        nn.Linear(hidden_dim, teacher_dim, bias=False),
+                    )
+                return nn.Linear(student_dim, teacher_dim, bias=False)
+
+            per_layer = bool(self.config.get("rep_full_projector_per_layer", False))
+            if per_layer and num_layers > 1:
+                self.rep_projector = _PerLayerRepProjector(build, num_layers).to(get_device_id())
+            else:
+                self.rep_projector = build().to(get_device_id())
             if self.actor_optimizer is not None and not self._rep_projector_in_optimizer:
                 self.actor_optimizer.add_param_group({"params": self.rep_projector.parameters()})
                 self._rep_projector_in_optimizer = True
@@ -1061,6 +1099,8 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
+        # LastOPD crossfade: one update_policy call = one training step; drives the schedule below
+        self._sched_step = getattr(self, "_sched_step", -1) + 1
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -1091,7 +1131,9 @@ class DataParallelPPOActor(BasePPOActor):
         )
         rep_distillation_last_k = int(self.config.get("rep_distillation_last_k", 32))
         rep_distillation_first_k = int(self.config.get("rep_distillation_first_k", 50))
-        multi_layer_rep = rep_distillation_layers != "last"
+        # Single-layer modes ("last", "emb", "first_1") keep the 3D repr; only true
+        # multi-layer modes stack to (B, L, K, D) where size(1) is the layer count.
+        multi_layer_rep = rep_layers_is_multi(rep_distillation_layers)
 
         select_keys = [
             "responses",
@@ -1212,7 +1254,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 elif "student_top_k_ids" in model_inputs:
                                     student_top_k_ids = model_inputs["student_top_k_ids"]
 
-                                entropy, _, _, topk_log_probs, student_repr_from_forward = self._forward_micro_batch(
+                                entropy, log_prob, _, topk_log_probs, student_repr_from_forward = self._forward_micro_batch(
                                     model_inputs,
                                     temperature=temperature,
                                     calculate_entropy=calculate_entropy,
@@ -1225,6 +1267,8 @@ class DataParallelPPOActor(BasePPOActor):
                                     rep_distillation_first_k=rep_distillation_first_k,
                                 )
                                 log_prob_for_loss = topk_log_probs
+                                # KL-to-ref acts on sampled tokens (2D), not the top-k grid
+                                log_prob_for_kl = log_prob
 
                             else:
                                 _, log_prob, _, _, student_repr_from_forward = self._forward_micro_batch(
@@ -1238,6 +1282,7 @@ class DataParallelPPOActor(BasePPOActor):
                                     rep_distillation_first_k=rep_distillation_first_k,
                                 )
                                 log_prob_for_loss = log_prob
+                                log_prob_for_kl = log_prob
 
                             format_mask = None
                             if "format_mask" in model_inputs.keys():
@@ -1309,7 +1354,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 ref_log_prob = model_inputs["ref_log_prob"]
                                 # compute kl loss
                                 kld = kl_penalty(
-                                    logprob=log_prob_for_loss,
+                                    logprob=log_prob_for_kl,
                                     ref_logprob=ref_log_prob,
                                     kl_penalty=self.config.kl_loss_type,
                                 )
@@ -1319,10 +1364,47 @@ class DataParallelPPOActor(BasePPOActor):
                                 micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                                 micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
+                            # LastOPD crossfade (token side): pg coef ramps 0 -> 1 over the first
+                            # token_coef_ramp_steps steps (linear, or a step function with rep_sched_style=hard)
+                            token_ramp = int(self.config.get("token_coef_ramp_steps", 0) or 0)
+                            if token_ramp > 0:
+                                _step_now = float(getattr(self, "_sched_step", 0))
+                                if str(self.config.get("rep_sched_style", "linear")) == "hard":
+                                    _ts = 0.0 if _step_now < token_ramp else 1.0
+                                else:
+                                    _ts = min(1.0, _step_now / float(token_ramp))
+                                policy_loss = policy_loss * _ts
+                                micro_batch_metrics["actor/token_coef_scale"] = _ts
+
                             micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
 
+                        elif self.config.use_kl_loss:
+                            # Pure-rep + KL self-preservation: no policy-gradient term, but one
+                            # forward yields sampled-token logprobs (for KL) and hidden repr
+                            # (for rep loss) so the rep block below reuses it.
+                            _, log_prob_kl, _, _, student_repr_from_forward = self._forward_micro_batch(
+                                model_inputs,
+                                temperature=temperature,
+                                calculate_entropy=False,
+                                return_response_hidden_repr=use_rep_distillation,
+                                rep_distillation_positions=rep_distillation_positions,
+                                rep_distillation_layers=rep_distillation_layers,
+                                rep_distillation_last_k=rep_distillation_last_k,
+                                rep_distillation_first_k=rep_distillation_first_k,
+                            )
+                            ref_log_prob = model_inputs["ref_log_prob"]
+                            kld = kl_penalty(
+                                logprob=log_prob_kl,
+                                ref_logprob=ref_log_prob,
+                                kl_penalty=self.config.kl_loss_type,
+                            )
+                            kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                            policy_loss = kl_loss * self.config.kl_loss_coef
+                            micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
+                            micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
                         if use_rep_distillation:
-                            teacher_repr = model_inputs["teacher_last_hidden_repr"]
+                            teacher_repr = model_inputs["teacher_last_hidden_repr"].float()  # cache may be bf16 (REP_TEACHER_CACHE_DTYPE)
                             response_mask = model_inputs["response_mask"]
                             if student_repr_from_forward is not None:
                                 student_repr = student_repr_from_forward
@@ -1393,7 +1475,11 @@ class DataParallelPPOActor(BasePPOActor):
                             rep_projector_mode = validate_rep_projector_mode(
                                 self.config.get("rep_projector_mode", "full")
                             )
-                            if student_dim == teacher_dim:
+                            # 同维师生默认直接对齐(无投影);但若配置显式要求 low_rank/低秩 MLP 头
+                            # (FitNets 式可训练预测头实验),尊重配置不强制覆盖
+                            if student_dim == teacher_dim and not self.config.get(
+                                "rep_allow_projector_same_dim", False
+                            ):
                                 rep_projector_mode = "full"
 
                             if rep_projector_mode == "low_rank":
@@ -1444,14 +1530,29 @@ class DataParallelPPOActor(BasePPOActor):
                                 micro_batch_metrics["rep/low_rank"] = float(residual_projector.tail_rank)
                                 micro_batch_metrics.update(residual_projector.projector_param_metrics())
                             else:
-                                projector = self._get_or_create_rep_projector(student_dim, teacher_dim)
+                                proj_layers = student_repr.size(1) if multi_layer_rep else 1
+                                projector = self._get_or_create_rep_projector(
+                                    student_dim, teacher_dim, num_layers=proj_layers
+                                )
                                 if projector is not None:
                                     student_repr = projector(student_repr)
-                                    w = projector.weight.detach().float()
+                                    probe = projector.heads[0] if isinstance(projector, _PerLayerRepProjector) else projector
+                                    if isinstance(probe, nn.Linear):
+                                        w = probe.weight.detach().float()
+                                        out_dim, in_dim = int(w.shape[0]), int(w.shape[1])
+                                        micro_batch_metrics["rep/full_projector_type_mlp"] = 0.0
+                                    else:
+                                        w = probe[0].weight.detach().float()
+                                        out_dim = int(probe[-1].weight.shape[0])
+                                        in_dim = int(w.shape[1])
+                                        micro_batch_metrics["rep/full_projector_type_mlp"] = 1.0
+                                    micro_batch_metrics["rep/full_projector_per_layer"] = float(
+                                        len(projector.heads) if isinstance(projector, _PerLayerRepProjector) else 0
+                                    )
                                     micro_batch_metrics["rep/ps_weight_norm_mean"] = float(w.norm().item())
                                     micro_batch_metrics["rep/ps_weight_norm_max"] = float(w.norm().item())
-                                    micro_batch_metrics["rep/full_projector_out_dim"] = float(w.shape[0])
-                                    micro_batch_metrics["rep/full_projector_in_dim"] = float(w.shape[1])
+                                    micro_batch_metrics["rep/full_projector_out_dim"] = float(out_dim)
+                                    micro_batch_metrics["rep/full_projector_in_dim"] = float(in_dim)
                                 micro_batch_metrics["rep/use_low_rank_projector"] = 0.0
                                 micro_batch_metrics["rep/teacher_pt_initialized"] = 0.0
                                 micro_batch_metrics["rep/projector_loaded_from_checkpoint"] = 0.0
@@ -1480,6 +1581,17 @@ class DataParallelPPOActor(BasePPOActor):
                             )
                             micro_batch_metrics["actor/rep_distillation_coef"] = rep_distillation_coef
                             rep_term = rep_loss * rep_distillation_coef
+                            # LastOPD crossfade (latent side): rep coef decays 1 -> 0 over the first
+                            # rep_coef_decay_steps steps (linear, or a step function with rep_sched_style=hard)
+                            rep_decay = int(self.config.get("rep_coef_decay_steps", 0) or 0)
+                            if rep_decay > 0:
+                                _rstep = float(getattr(self, "_sched_step", 0))
+                                if str(self.config.get("rep_sched_style", "linear")) == "hard":
+                                    _rs = 1.0 if _rstep < rep_decay else 0.0
+                                else:
+                                    _rs = max(0.0, 1.0 - _rstep / float(rep_decay))
+                                rep_term = rep_term * _rs
+                                micro_batch_metrics["actor/rep_coef_scale"] = _rs
                             if policy_loss is None:
                                 policy_loss = rep_term
                             else:

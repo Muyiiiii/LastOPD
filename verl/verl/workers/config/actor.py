@@ -151,9 +151,16 @@ class ActorConfig(BaseConfig):
     rep_low_rank: int = 256
     rep_low_rank_init_checkpoint: Optional[str] = None
     rep_ps_projector: str = "auto"
+    rep_full_projector: str = "linear"
+    rep_full_projector_per_layer: bool = False
     rep_mlp_hidden_mult: int = 4
     rep_freeze_ps: bool = False
     rep_head_rank: int = 16
+    # LastOPD crossfade schedule: latent (rep) coef decays 1->0 over rep_coef_decay_steps while the
+    # token (pg) coef ramps 0->1 over token_coef_ramp_steps; 0 = off. rep_sched_style: linear | hard
+    rep_coef_decay_steps: int = 0
+    token_coef_ramp_steps: int = 0
+    rep_sched_style: str = "linear"
     rep_head_init_checkpoint: Optional[str] = None
     use_att_distillation: bool = False
     att_distillation_coef: float = 1.0
