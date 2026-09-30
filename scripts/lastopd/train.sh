@@ -157,7 +157,7 @@ python3 -m verl.trainer.main_ppo \
     +reward_model.model.dtype=${REWARD_DTYPE:-$MODEL_DTYPE} \
     reward_model.micro_batch_size_per_gpu=${REWARD_MICRO_BS:-4} \
     reward_model.use_dynamic_bsz=False \
-    custom_reward_function.path="verl/utils/reward_score/ttrl_math/__init__.py" \
+    custom_reward_function.path="$ROOT/verl/verl/utils/reward_score/ttrl_math/__init__.py" \
     custom_reward_function.name=reward_func \
     trainer.val_before_train=True \
     trainer.log_val_generations=2 \
